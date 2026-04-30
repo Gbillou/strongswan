@@ -17,6 +17,8 @@
 #include "xauth.h"
 
 #include <daemon.h>
+#include <string.h>
+#include <arpa/inet.h>
 #include <encoding/payloads/cp_payload.h>
 #include <processing/jobs/adopt_children_job.h>
 #include <sa/ikev1/tasks/mode_config.h>
@@ -75,6 +77,12 @@ struct private_xauth_t {
 	 * status of Xauth exchange
 	 */
 	xauth_status_t status;
+
+	/**
+	 * Received a non-XAUTH CFG_SET (Mode Config push), task should complete
+	 * after sending the ACK.
+	 */
+	bool modeconfig_push_done;
 
 	/**
 	 * Queue a Mode Config Push mode after completing XAuth?
@@ -408,6 +416,281 @@ METHOD(task_t, process_r, status_t,
 	}
 	if (cp->get_type(cp) == CFG_REQUEST)
 	{
+		/* Scan attributes to classify this request:
+		 * - Standard XAUTH (types 16520+)
+		 * - Check Point proprietary XAUTH (types 13-22 with different semantics)
+		 * - Mode Config probe (SUBNET, SUPPORTED_ATTRIBUTES) */
+		bool has_xauth_attrs = FALSE;
+		bool has_modeconfig_attrs = FALSE;
+		bool has_subnet = FALSE;
+		bool has_sup = FALSE;
+		bool has_cp_challenge = FALSE;
+		configuration_attribute_type_t cp_response_type = 0;
+		enumerator_t *enumerator;
+		configuration_attribute_t *attribute;
+
+		enumerator = cp->create_attribute_enumerator(cp);
+		while (enumerator->enumerate(enumerator, &attribute))
+		{
+			configuration_attribute_type_t type = attribute->get_type(attribute);
+			chunk_t data = attribute->get_chunk(attribute);
+			if (type >= 16520 && type <= 16529)
+			{
+				has_xauth_attrs = TRUE;
+			}
+			else
+			{
+				has_modeconfig_attrs = TRUE;
+				if (type == INTERNAL_IP4_SUBNET)
+				{
+					has_subnet = TRUE;
+				}
+				else if (type == SUPPORTED_ATTRIBUTES)
+				{
+					has_sup = TRUE;
+				}
+			}
+			/* Check Point Challenge: type 18 (INTERNAL_IP6_PREFIX in IKE)
+			 * carries "prompt\0(S-expression msg_obj)" */
+			if (type == INTERNAL_IP6_PREFIX && data.len > 0 &&
+				data.ptr != NULL && memchr(data.ptr, '\0', data.len))
+			{
+				has_cp_challenge = TRUE;
+			}
+			/* Find CP response type: first attribute that isn't
+			 * AuthType(13=INTERNAL_IP4_SUBNET), Challenge(18=INTERNAL_IP6_PREFIX),
+			 * or Status(20=P_CSCF_IP4_ADDRESS) but is a CP credential type:
+			 * UserName(14=SUPPORTED_ATTRIBUTES), UserPassword(15=INTERNAL_IP6_SUBNET),
+			 * Passcode(16=MIP6_HOME_PREFIX) */
+			if (cp_response_type == 0 &&
+				(type == SUPPORTED_ATTRIBUTES ||     /* 14 = CP UserName */
+				 type == INTERNAL_IP6_SUBNET ||      /* 15 = CP UserPassword */
+				 type == MIP6_HOME_PREFIX))           /* 16 = CP Passcode */
+			{
+				cp_response_type = type;
+			}
+		}
+		enumerator->destroy(enumerator);
+
+		if (cp_response_type != 0 && has_subnet)
+		{
+			/* === Check Point Proprietary XAUTH Exchange ===
+			 * Gateway sent TRANSACTION CFG_REQUEST with CP-proprietary types:
+			 *   AuthType(13) + UserName(14)/UserPassword(15)/Passcode(16)
+			 *   Optionally: Challenge(18)="prompt\0(S-expression)"
+			 * Response: CFG_REPLY with AuthType(13)=0 + credential in the
+			 * response type (UserPassword/Passcode/UserName) */
+			cp_payload_t *reply;
+			uint16_t id;
+
+			/* Log the challenge prompt */
+			enumerator = cp->create_attribute_enumerator(cp);
+			while (enumerator->enumerate(enumerator, &attribute))
+			{
+				if (attribute->get_type(attribute) == INTERNAL_IP6_PREFIX)
+				{
+					chunk_t data = attribute->get_chunk(attribute);
+					uint8_t *nul = memchr(data.ptr, '\0', data.len);
+					if (nul)
+					{
+						DBG1(DBG_IKE, "CP challenge: '%.*s'",
+							 (int)(nul - data.ptr), data.ptr);
+					}
+				}
+			}
+			enumerator->destroy(enumerator);
+
+			id = cp->get_identifier(cp);
+			reply = cp_payload_create_type(PLV1_CONFIGURATION, CFG_REPLY);
+			reply->set_identifier(reply, id);
+
+			/* AuthType = Generic (short/TV attribute, CP type 13, value 0) */
+			reply->add_attribute(reply,
+				configuration_attribute_create_value(
+					INTERNAL_IP4_SUBNET, 0));
+
+			if (cp_response_type == SUPPORTED_ATTRIBUTES)
+			{
+				/* CP UserName (type 14): auto-respond with XAUTH username */
+				identification_t *user_id = this->user;
+				if (!user_id)
+				{
+					user_id = this->ike_sa->get_my_id(this->ike_sa);
+				}
+				if (user_id)
+				{
+					chunk_t name = user_id->get_encoding(user_id);
+					DBG1(DBG_IKE, "CP XAUTH: sending username in attr %d",
+						 cp_response_type);
+					reply->add_attribute(reply,
+						configuration_attribute_create_chunk(
+							PLV1_CONFIGURATION_ATTRIBUTE,
+							cp_response_type, name));
+				}
+			}
+			else
+			{
+				/* CP UserPassword(15) or Passcode(16): send credential */
+				shared_key_t *shared;
+				identification_t *me, *other;
+
+				me = this->ike_sa->get_my_id(this->ike_sa);
+				other = this->ike_sa->get_other_id(this->ike_sa);
+				shared = lib->credmgr->get_shared(lib->credmgr,
+							SHARED_EAP, me, other);
+				if (shared)
+				{
+					chunk_t secret = shared->get_key(shared);
+					DBG1(DBG_IKE, "CP XAUTH: sending credential in attr %d",
+						 cp_response_type);
+					reply->add_attribute(reply,
+						configuration_attribute_create_chunk(
+							PLV1_CONFIGURATION_ATTRIBUTE,
+							cp_response_type, secret));
+					shared->destroy(shared);
+				}
+				else
+				{
+					DBG1(DBG_IKE, "CP XAUTH: no credential available");
+				}
+			}
+
+			this->cp = reply;
+			return NEED_MORE;
+		}
+
+		if (!has_xauth_attrs && has_modeconfig_attrs)
+		{
+			cp_payload_t *reply;
+			uint16_t id;
+
+			DBG1(DBG_IKE, "responding to pre-XAUTH Mode Config request "
+				 "(SUBNET=%d SUP=%d)", has_subnet, has_sup);
+			id = cp->get_identifier(cp);
+			reply = cp_payload_create_type(PLV1_CONFIGURATION, CFG_REPLY);
+			reply->set_identifier(reply, id);
+
+			/* Re-iterate attributes and respond to each one */
+			enumerator = cp->create_attribute_enumerator(cp);
+			while (enumerator->enumerate(enumerator, &attribute))
+			{
+				configuration_attribute_type_t type = attribute->get_type(attribute);
+				if (type == INTERNAL_IP4_SUBNET)
+				{
+					uint8_t subnet[8] = {0}; /* 0.0.0.0/0.0.0.0 = any */
+					reply->add_attribute(reply,
+						configuration_attribute_create_chunk(
+							PLV1_CONFIGURATION_ATTRIBUTE,
+							INTERNAL_IP4_SUBNET,
+							chunk_create(subnet, sizeof(subnet))));
+				}
+				else if (type == INTERNAL_IP6_SUBNET)
+				{
+					uint8_t subnet6[18] = {0}; /* ::/0 */
+					reply->add_attribute(reply,
+						configuration_attribute_create_chunk(
+							PLV1_CONFIGURATION_ATTRIBUTE,
+							INTERNAL_IP6_SUBNET,
+							chunk_create(subnet6, sizeof(subnet6))));
+				}
+				else if (type == INTERNAL_IP6_PREFIX)
+				{
+					/* Check Point encodes password/challenge prompts in this
+					 * attribute as: "prompt text\0(msg_obj S-expression...)" */
+					chunk_t data = attribute->get_chunk(attribute);
+					if (data.len > 0 && data.ptr != NULL &&
+						memchr(data.ptr, '\0', data.len) != NULL)
+					{
+						/* This contains a challenge prompt — respond with
+						 * the password from the credential manager */
+						char *prompt = (char *)data.ptr;
+						shared_key_t *shared;
+						identification_t *me, *other;
+
+						DBG1(DBG_IKE, "Check Point challenge: '%s'", prompt);
+						/* Log the S-expression after null for debugging */
+						{
+							uint8_t *null_pos = memchr(data.ptr, '\0', data.len);
+							if (null_pos)
+							{
+								size_t sexpr_off = (null_pos - data.ptr) + 1;
+								size_t sexpr_len = data.len - sexpr_off;
+								if (sexpr_len > 0 && sexpr_len < 2048)
+								{
+									DBG1(DBG_IKE, "  challenge sexpr: '%.*s'",
+										 (int)sexpr_len, data.ptr + sexpr_off);
+								}
+							}
+						}
+						me = this->ike_sa->get_my_id(this->ike_sa);
+						other = this->ike_sa->get_other_id(this->ike_sa);
+						shared = lib->credmgr->get_shared(lib->credmgr,
+									SHARED_EAP, me, other);
+						if (shared)
+						{
+							chunk_t secret = shared->get_key(shared);
+							reply->add_attribute(reply,
+								configuration_attribute_create_chunk(
+									PLV1_CONFIGURATION_ATTRIBUTE,
+									INTERNAL_IP6_PREFIX,
+									secret));
+							shared->destroy(shared);
+						}
+						else
+						{
+							DBG1(DBG_IKE, "no credentials available for CP challenge");
+							reply->add_attribute(reply,
+								configuration_attribute_create_chunk(
+									PLV1_CONFIGURATION_ATTRIBUTE,
+									INTERNAL_IP6_PREFIX, chunk_empty));
+						}
+					}
+					else
+					{
+						uint8_t pfx6[17] = {0};
+						reply->add_attribute(reply,
+							configuration_attribute_create_chunk(
+								PLV1_CONFIGURATION_ATTRIBUTE,
+								INTERNAL_IP6_PREFIX,
+								chunk_create(pfx6, sizeof(pfx6))));
+					}
+				}
+				else if (type == SUPPORTED_ATTRIBUTES)
+				{
+					uint16_t attrs[] = {
+						htons(INTERNAL_IP4_ADDRESS),
+						htons(INTERNAL_IP4_NETMASK),
+						htons(INTERNAL_IP4_DNS),
+						htons(INTERNAL_IP4_SUBNET),
+						htons(XAUTH_TYPE),
+						htons(XAUTH_USER_NAME),
+						htons(XAUTH_USER_PASSWORD),
+						htons(XAUTH_PASSCODE),
+						htons(XAUTH_MESSAGE),
+						htons(XAUTH_CHALLENGE),
+						htons(XAUTH_STATUS),
+					};
+					reply->add_attribute(reply,
+						configuration_attribute_create_chunk(
+							PLV1_CONFIGURATION_ATTRIBUTE,
+							SUPPORTED_ATTRIBUTES,
+							chunk_create((uint8_t*)attrs, sizeof(attrs))));
+				}
+				else
+				{
+					/* Echo back unknown non-XAUTH attributes with empty data */
+					reply->add_attribute(reply,
+						configuration_attribute_create_chunk(
+							PLV1_CONFIGURATION_ATTRIBUTE,
+							type, chunk_empty));
+				}
+			}
+			enumerator->destroy(enumerator);
+
+			this->cp = reply;
+			return NEED_MORE;
+		}
+
 		switch (this->xauth->process(this->xauth, cp, &this->cp))
 		{
 			case NEED_MORE:
@@ -422,6 +705,152 @@ METHOD(task_t, process_r, status_t,
 	}
 	if (cp->get_type(cp) == CFG_SET)
 	{
+		/* Check Point gateways use CFG_SET for:
+		 * 1) Mode Config push (non-XAUTH attrs) before XAUTH
+		 * 2) XAUTH status response with CP Status(20) after auth
+		 * 3) Standard XAUTH with types 16520+ */
+		bool has_xauth_set = FALSE;
+		bool has_cp_status = FALSE;
+		uint16_t cp_status_val = 0;
+		configuration_attribute_t *attr_check;
+		enumerator_t *set_enum;
+
+		set_enum = cp->create_attribute_enumerator(cp);
+		while (set_enum->enumerate(set_enum, &attr_check))
+		{
+			configuration_attribute_type_t stype = attr_check->get_type(attr_check);
+			if (stype >= 16520 && stype <= 16529)
+			{
+				has_xauth_set = TRUE;
+			}
+			/* CP Status: type 20 (P_CSCF_IP4_ADDRESS in IKE) */
+			if (stype == P_CSCF_IP4_ADDRESS)
+			{
+				has_cp_status = TRUE;
+				cp_status_val = attr_check->get_value(attr_check);
+				DBG1(DBG_IKE, "CP Status attribute: value=%d", cp_status_val);
+			}
+			/* Log CP Message (type 17 = INTERNAL_IP6_LINK) for debugging */
+			if (stype == INTERNAL_IP6_LINK)
+			{
+				chunk_t mdata = attr_check->get_chunk(attr_check);
+				if (mdata.len > 0 && mdata.len < 2048)
+				{
+					uint8_t *nul = memchr(mdata.ptr, '\0', mdata.len);
+					if (nul)
+					{
+						DBG1(DBG_IKE, "CP Message: '%.*s'",
+							 (int)(nul - mdata.ptr), mdata.ptr);
+					}
+				}
+			}
+		}
+		set_enum->destroy(set_enum);
+
+		if (has_cp_status)
+		{
+			/* Check Point XAUTH status response */
+			cp_payload_t *ack;
+			ack = cp_payload_create_type(PLV1_CONFIGURATION, CFG_ACK);
+			ack->set_identifier(ack, cp->get_identifier(cp));
+			/* Echo the Status attribute in the ACK */
+			ack->add_attribute(ack,
+				configuration_attribute_create_value(
+					P_CSCF_IP4_ADDRESS, cp_status_val));
+			this->cp = ack;
+
+			if (cp_status_val == 1)
+			{
+				DBG1(DBG_IKE, "CP XAUTH authentication succeeded");
+				this->status = XAUTH_OK;
+				identification_t *user_id = this->user;
+				if (!user_id)
+				{
+					user_id = this->ike_sa->get_my_id(this->ike_sa);
+				}
+				add_auth_cfg(this, user_id, TRUE);
+			}
+			else
+			{
+				DBG1(DBG_IKE, "CP XAUTH authentication failed (status=%d)",
+					 cp_status_val);
+				this->status = XAUTH_FAILED;
+			}
+			this->identifier = cp->get_identifier(cp);
+			this->public.task.build = _build_r_ack;
+			return NEED_MORE;
+		}
+
+		if (!has_xauth_set)
+		{
+			cp_payload_t *ack;
+
+			DBG1(DBG_IKE, "acknowledging pre-XAUTH Mode Config push");
+			ack = cp_payload_create_type(PLV1_CONFIGURATION, CFG_ACK);
+			ack->set_identifier(ack, cp->get_identifier(cp));
+
+			/* Log and echo attribute types for debugging */
+			set_enum = cp->create_attribute_enumerator(cp);
+			while (set_enum->enumerate(set_enum, &attr_check))
+			{
+				chunk_t data = attr_check->get_chunk(attr_check);
+				DBG1(DBG_IKE, "  CPS attr type %d, len %zu",
+					 attr_check->get_type(attr_check), data.len);
+				if (data.len > 0 && data.len < 2048)
+				{
+					/* Check if data contains a null byte (S-expr) */
+					void *null_pos = memchr(data.ptr, '\0', data.len);
+					if (null_pos)
+					{
+						/* Print the text part before null */
+						size_t text_len = (uint8_t*)null_pos - data.ptr;
+						if (text_len > 0 && text_len < 256)
+						{
+							DBG1(DBG_IKE, "  CPS text: '%.*s'",
+								 (int)text_len, data.ptr);
+						}
+						/* Print the S-expr part after null */
+						size_t sexpr_off = text_len + 1;
+						size_t sexpr_len = data.len - sexpr_off;
+						if (sexpr_len > 0 && sexpr_len < 2048)
+						{
+							DBG1(DBG_IKE, "  CPS sexpr(%zu): '%.*s'",
+								 sexpr_len, (int)sexpr_len,
+								 data.ptr + sexpr_off);
+						}
+					}
+					else if (data.len < 512)
+					{
+						/* Try printing as plain text */
+						bool printable = TRUE;
+						size_t i;
+						for (i = 0; i < data.len && i < 256; i++)
+						{
+							if (data.ptr[i] < 0x20 || data.ptr[i] > 0x7e)
+							{
+								printable = FALSE;
+								break;
+							}
+						}
+						if (printable)
+						{
+							DBG1(DBG_IKE, "  CPS text: '%.*s'",
+								 (int)data.len, data.ptr);
+						}
+					}
+				}
+				ack->add_attribute(ack,
+					configuration_attribute_create_chunk(
+						PLV1_CONFIGURATION_ATTRIBUTE,
+						attr_check->get_type(attr_check), chunk_empty));
+			}
+			set_enum->destroy(set_enum);
+
+			this->cp = ack;
+			/* Continue waiting for XAUTH challenge from gateway */
+			return NEED_MORE;
+		}
+
 		configuration_attribute_t *attribute;
 		enumerator_t *enumerator;
 
