@@ -345,6 +345,46 @@ METHOD(task_t, build_i, status_t,
 
 			add_initial_contact(this, message, id);
 
+			/* Check Point CccAuth: inject authentication realm notification
+			 * into Identity Protection message (msg 5). This tells the CP
+			 * gateway our client type, protocol version, and selected
+			 * authentication realm for XAUTH. Without this, the gateway
+			 * does not initiate proper XAUTH exchanges. */
+			{
+				notify_payload_t *ccc_auth;
+				ike_sa_id_t *sa_id;
+				uint64_t spi_i, spi_r;
+				chunk_t spi, blob_chunk;
+				char blob[] =
+					"(:clientType (TRAC)"
+					" :client_logging_data ("
+					":device_id (strongswan)"
+					" :machine_name (strongswan-client)"
+					" :os_name (Windows)"
+					")"
+					" :client_mode (secure_connect)"
+					" :oldSessionId ()"
+					" :protocolVersion (100)"
+					" :selected_realm_id (vpn_Username_Password)"
+					")";
+
+				ccc_auth = notify_payload_create_from_protocol_and_type(
+								PLV1_NOTIFY, PROTO_IKE,
+								(notify_type_t)0x8004);
+				sa_id = this->ike_sa->get_id(this->ike_sa);
+				spi_i = sa_id->get_initiator_spi(sa_id);
+				spi_r = sa_id->get_responder_spi(sa_id);
+				spi = chunk_cata("cc",
+						chunk_from_thing(spi_i),
+						chunk_from_thing(spi_r));
+				ccc_auth->set_spi_data(ccc_auth, spi);
+				blob_chunk = chunk_create((uint8_t*)blob, strlen(blob));
+				ccc_auth->set_notification_data(ccc_auth, blob_chunk);
+				message->add_payload(message, (payload_t*)ccc_auth);
+				DBG1(DBG_IKE, "injected CccAuth notification "
+					 "(realm=vpn_Username_Password, proto=100)");
+			}
+
 			this->state = MM_AUTH;
 			return NEED_MORE;
 		}
@@ -615,14 +655,18 @@ METHOD(task_t, build_r, status_t,
 }
 
 /**
- * Schedule a timeout for the IKE_SA should it not establish
+ * Schedule a timeout for the IKE_SA should it not establish.
+ * Use configurable half_open_timeout (default 120s to allow 2FA).
  */
 static void schedule_timeout(ike_sa_t *ike_sa)
 {
 	job_t *job;
+	int timeout;
 
+	timeout = lib->settings->get_int(lib->settings,
+				"%s.half_open_timeout", 120, lib->ns);
 	job = (job_t*)delete_ike_sa_job_create(ike_sa->get_id(ike_sa), FALSE);
-	lib->scheduler->schedule_job(lib->scheduler, job, HALF_OPEN_IKE_SA_TIMEOUT);
+	lib->scheduler->schedule_job(lib->scheduler, job, timeout);
 }
 
 METHOD(task_t, process_i, status_t,
