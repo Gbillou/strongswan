@@ -95,9 +95,21 @@ static shared_key_t* callback_shared(private_cmd_creds_t *this,
 		default:
 			return NULL;
 	}
+	/* Check for password in environment variable (for automation) */
+	if (type == SHARED_EAP)
+	{
+		char *env_pwd = getenv("CHARON_EAP_PASSWORD");
+		if (env_pwd && strlen(env_pwd) > 0)
+		{
+			pwd = env_pwd;
+		}
+	}
+	if (!pwd)
+	{
 #ifdef HAVE_GETPASS
-	pwd = getpass(label);
+		pwd = getpass(label);
 #endif
+	}
 	if (!pwd || strlen(pwd) == 0)
 	{
 		return NULL;
