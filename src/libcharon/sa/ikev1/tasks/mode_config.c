@@ -17,7 +17,15 @@
 #include "mode_config.h"
 
 #include <daemon.h>
+#include <arpa/inet.h>
 #include <encoding/payloads/cp_payload.h>
+
+#include <ifaddrs.h>
+#ifdef __APPLE__
+#include <net/if_dl.h>
+#else
+#include <netpacket/packet.h>
+#endif
 
 typedef struct private_mode_config_t private_mode_config_t;
 
@@ -136,8 +144,9 @@ static void process_attribute(private_mode_config_t *this,
 	host_t *ip;
 	chunk_t addr;
 	int family = AF_INET6;
+	configuration_attribute_type_t attr_type = ca->get_type(ca);
 
-	switch (ca->get_type(ca))
+	switch (attr_type)
 	{
 		case INTERNAL_IP4_ADDRESS:
 			family = AF_INET;
@@ -166,6 +175,36 @@ static void process_attribute(private_mode_config_t *this,
 		}
 		default:
 		{
+			/* Log Check Point Office Mode response attributes */
+			if ((uint16_t)attr_type >= 0x4000)
+			{
+				chunk_t val = ca->get_chunk(ca);
+				switch ((uint16_t)attr_type)
+				{
+					case 0x4045: /* CccSessionId */
+						DBG1(DBG_IKE, "CP OM: session ID (%zu bytes)", val.len);
+						break;
+					case 0x4047: /* CccOfficeModeAllowed */
+						DBG1(DBG_IKE, "CP OM: office mode allowed = %d",
+							 ca->get_value(ca));
+						break;
+					case 0x404c: /* CccConnectAllowed */
+						DBG1(DBG_IKE, "CP OM: connect allowed = %d",
+							 ca->get_value(ca));
+						break;
+					case 0x4003: /* InternalDomainName */
+						if (val.len > 0 && val.len < 1024)
+						{
+							DBG1(DBG_IKE, "CP OM: domain '%.*s'",
+								 (int)val.len, val.ptr);
+						}
+						break;
+					default:
+						DBG1(DBG_IKE, "CP OM: attr 0x%04x (%zu bytes)",
+							 (uint16_t)attr_type, val.len);
+						break;
+				}
+			}
 			if (this->initiator == this->pull)
 			{
 				handle_attribute(this, ca);
@@ -264,6 +303,147 @@ static void add_attribute(private_mode_config_t *this, cp_payload_t *cp,
 }
 
 /**
+ * Check Point proprietary Office Mode attribute types.
+ * These are sent in IKEv1 Mode Config CFG_REQUEST to request an Office Mode
+ * IP address lease from a Check Point gateway.
+ */
+enum {
+	CP_INTERNAL_DOMAIN_NAME     = 0x4003,
+	CP_MAC_ADDRESS              = 0x4004,
+	CP_CCC_SESSION_ID           = 0x4045,
+	CP_CCC_VARIABLE_LEASE_TIME  = 0x4046,
+	CP_CCC_OFFICE_MODE_ALLOWED  = 0x4047,
+	CP_CCC_CONNECT_ALLOWED      = 0x404c,
+};
+
+/**
+ * Get the MAC address of the primary network interface.
+ * Returns TRUE and fills mac_out (6 bytes) on success.
+ */
+static bool get_primary_mac(uint8_t *mac_out)
+{
+	struct ifaddrs *ifap, *ifa;
+
+	if (getifaddrs(&ifap) != 0)
+	{
+		return FALSE;
+	}
+	for (ifa = ifap; ifa; ifa = ifa->ifa_next)
+	{
+		if (!ifa->ifa_addr)
+		{
+			continue;
+		}
+#ifdef __APPLE__
+		if (ifa->ifa_addr->sa_family == AF_LINK)
+		{
+			struct sockaddr_dl *sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+			if (sdl->sdl_alen == 6)
+			{
+				uint8_t *addr = (uint8_t *)LLADDR(sdl);
+				/* skip zero/loopback MACs */
+				if (addr[0] || addr[1] || addr[2] ||
+					addr[3] || addr[4] || addr[5])
+				{
+					memcpy(mac_out, addr, 6);
+					freeifaddrs(ifap);
+					return TRUE;
+				}
+			}
+		}
+#else
+		if (ifa->ifa_addr->sa_family == AF_PACKET)
+		{
+			struct sockaddr_ll *sll = (struct sockaddr_ll *)ifa->ifa_addr;
+			if (sll->sll_halen == 6)
+			{
+				/* skip zero/loopback MACs */
+				if (sll->sll_addr[0] || sll->sll_addr[1] || sll->sll_addr[2] ||
+					sll->sll_addr[3] || sll->sll_addr[4] || sll->sll_addr[5])
+				{
+					memcpy(mac_out, sll->sll_addr, 6);
+					freeifaddrs(ifap);
+					return TRUE;
+				}
+			}
+		}
+#endif
+	}
+	freeifaddrs(ifap);
+	return FALSE;
+}
+
+/**
+ * Build a Check Point Office Mode CFG_REQUEST as initiator.
+ * Sends the CP-proprietary attributes that the gateway requires to assign
+ * a virtual IP address (Office Mode lease).
+ *
+ * The attribute format follows the snx-rs reference implementation:
+ * - All "empty" request attributes are sent as long (TLV) with 4 zero bytes
+ * - Attribute order: DNS, AddressExpiry, InternalDomainName, CccSessionId,
+ *   CccVariableLeaseTime, CccOfficeModeAllowed, CccConnectAllowed,
+ *   MacAddress, Ipv4Address, Ipv4Netmask
+ */
+static status_t build_cp_om_request(private_mode_config_t *this,
+									message_t *message)
+{
+	cp_payload_t *cp;
+	uint8_t mac[6] = {0};
+	uint8_t zeros[4] = {0, 0, 0, 0};
+	chunk_t zero4 = chunk_create(zeros, 4);
+
+	cp = cp_payload_create_type(PLV1_CONFIGURATION, CFG_REQUEST);
+
+	/* All "requesting" attributes use 4 zero bytes (not empty TLV).
+	 * Order matches snx-rs build_om_cfg(): CP attrs first, then MAC,
+	 * then standard ADDR/MASK last. */
+	add_attribute(this, cp, INTERNAL_IP4_DNS, zero4, NULL);
+	add_attribute(this, cp, INTERNAL_ADDRESS_EXPIRY, zero4, NULL);
+	add_attribute(this, cp,
+		(configuration_attribute_type_t)CP_INTERNAL_DOMAIN_NAME,
+		zero4, NULL);
+	add_attribute(this, cp,
+		(configuration_attribute_type_t)CP_CCC_SESSION_ID,
+		zero4, NULL);
+	add_attribute(this, cp,
+		(configuration_attribute_type_t)CP_CCC_VARIABLE_LEASE_TIME,
+		zero4, NULL);
+	add_attribute(this, cp,
+		(configuration_attribute_type_t)CP_CCC_OFFICE_MODE_ALLOWED,
+		zero4, NULL);
+	add_attribute(this, cp,
+		(configuration_attribute_type_t)CP_CCC_CONNECT_ALLOWED,
+		zero4, NULL);
+
+	/* MacAddress: real NIC MAC (6 bytes) for device tracking */
+	if (get_primary_mac(mac))
+	{
+		chunk_t mac_chunk = chunk_create(mac, 6);
+		DBG1(DBG_IKE, "CP Office Mode: MAC %02x:%02x:%02x:%02x:%02x:%02x",
+			 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+		add_attribute(this, cp,
+			(configuration_attribute_type_t)CP_MAC_ADDRESS,
+			mac_chunk, NULL);
+	}
+	else
+	{
+		DBG1(DBG_IKE, "CP Office Mode: MAC address not available, using zeros");
+		add_attribute(this, cp,
+			(configuration_attribute_type_t)CP_MAC_ADDRESS,
+			zero4, NULL);
+	}
+
+	/* Ipv4Address and Ipv4Netmask: 4 zero bytes = "assign me an address" */
+	add_attribute(this, cp, INTERNAL_IP4_ADDRESS, zero4, NULL);
+	add_attribute(this, cp, INTERNAL_IP4_NETMASK, zero4, NULL);
+
+	DBG1(DBG_IKE, "sending Check Point Office Mode request");
+	message->add_payload(message, (payload_t*)cp);
+
+	return NEED_MORE;
+}
+
+/**
  * Build a CFG_REQUEST as initiator
  */
 static status_t build_request(private_mode_config_t *this, message_t *message)
@@ -276,6 +456,14 @@ static status_t build_request(private_mode_config_t *this, message_t *message)
 	chunk_t data;
 	linked_list_t *vips;
 	host_t *host;
+
+	/* Check Point Office Mode: send CP-proprietary attributes instead of
+	 * standard Mode Config.  Enable via charon(-cmd).checkpoint_office_mode */
+	if (lib->settings->get_bool(lib->settings,
+								"%s.checkpoint_office_mode", FALSE, lib->ns))
+	{
+		return build_cp_om_request(this, message);
+	}
 
 	cp = cp_payload_create_type(PLV1_CONFIGURATION, CFG_REQUEST);
 
@@ -548,6 +736,34 @@ static status_t build_reply(private_mode_config_t *this, message_t *message)
 												 type, value));
 	}
 	enumerator->destroy(enumerator);
+
+	/* If the response is still empty (no VIPs, no provider attrs), respond
+	 * to any INTERNAL_IP4_SUBNET / SUPPORTED_ATTRIBUTES requests from the
+	 * server. Check Point gateways send CFG_REQUEST with these and expect
+	 * a non-empty CFG_REPLY before proceeding to XAUTH. */
+	if (this->vips->get_count(this->vips) == 0)
+	{
+		/* Respond with INTERNAL_IP4_SUBNET = 0.0.0.0/0.0.0.0 (full tunnel) */
+		uint8_t subnet_data[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+		chunk_t subnet_chunk = { subnet_data, sizeof(subnet_data) };
+		cp->add_attribute(cp,
+			configuration_attribute_create_chunk(PLV1_CONFIGURATION_ATTRIBUTE,
+				INTERNAL_IP4_SUBNET, subnet_chunk));
+		DBG1(DBG_IKE, "responding to server CFG_REQUEST with SUBNET 0.0.0.0/0");
+
+		/* Respond with SUPPORTED_ATTRIBUTES listing what we handle */
+		uint16_t sup_types[] = {
+			htons(INTERNAL_IP4_ADDRESS),
+			htons(INTERNAL_IP4_NETMASK),
+			htons(INTERNAL_IP4_DNS),
+			htons(INTERNAL_IP4_SUBNET),
+		};
+		chunk_t sup_chunk = { (uint8_t*)sup_types, sizeof(sup_types) };
+		cp->add_attribute(cp,
+			configuration_attribute_create_chunk(PLV1_CONFIGURATION_ATTRIBUTE,
+				SUPPORTED_ATTRIBUTES, sup_chunk));
+	}
+
 	/* if a client did not re-request all addresses, release them */
 	enumerator = migrated->create_enumerator(migrated);
 	while (enumerator->enumerate(enumerator, &found))
