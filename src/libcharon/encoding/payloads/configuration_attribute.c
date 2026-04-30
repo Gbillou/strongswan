@@ -124,6 +124,17 @@ METHOD(payload_t, verify, status_t,
 {
 	bool failed = FALSE;
 
+	/* Check Point uses IKEv1 config attribute types 13-22 with different
+	 * semantics (AuthType, UserName, UserPassword, Passcode, Message,
+	 * Challenge, Domain, Status, NextPin, Answer). Skip length validation
+	 * for these types in IKEv1 mode to avoid rejecting valid CP responses. */
+	if (this->type == PLV1_CONFIGURATION_ATTRIBUTE &&
+		this->attr_type >= INTERNAL_IP4_SUBNET &&
+		this->attr_type <= FTT_KAT)
+	{
+		return SUCCESS;
+	}
+
 	switch (this->attr_type)
 	{
 		case INTERNAL_IP4_ADDRESS:
